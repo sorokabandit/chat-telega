@@ -6,10 +6,13 @@ const authMiddleware = require("../src/middlewares/check-token");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const { createServer } = require("http");
+const { setIo } = require("../src/socket.js");
 
 
 const ACCESS_TOKEN_SECRET = "supersecret_access";
 
+// Храним соответствие userId и socket.id
+const userSocketMap = new Map();
 
 const jwt = require("jsonwebtoken");
 
@@ -24,6 +27,9 @@ const io = new Server(httpServer, {
     methods: ["GET", "POST"],
   },
 });
+
+// Сохраняем io в модуле socket.js
+setIo(io);
 
 // Проверка JWT для Socket.IO
 io.use((socket, next) => {
@@ -42,11 +48,26 @@ io.use((socket, next) => {
 
 // Подключение Socket.IO
 io.on("connection", (socket) => {
-  console.log(`User connected: ${socket.user.username}`);
+  console.log(`User connected: ${socket.user.userId}, socket.id: ${socket.id}`);
+
+  // Сохраняем соответствие userId и socket.id
+  userSocketMap.set(socket.user.userId, socket.id);
+
+  // Присоединяем пользователя к комнате
+  const roomId = createRoomId(socket.user.userId);
+  socket.join(roomId);
+  console.log(`User ${socket.user.userId} joined room ${roomId}`);
+
   socket.on("disconnect", () => {
-    console.log(`User disconnected: ${socket.user.username}`);
+    userSocketMap.delete(socket.user.userId);
+    console.log(`User disconnected: ${socket.user.userId}, socket.id: ${socket.id}`);
   });
 });
+
+// Функция для создания уникального ID комнаты
+function createRoomId(userId) {
+  return `chat-${userId}`;
+}
 
 app.use(
   cors({

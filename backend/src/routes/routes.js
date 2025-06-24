@@ -1,5 +1,6 @@
 const { sequelize, User, RefreshToken, Message } = require("../../config/db");
 const { Bot } = require("grammy");
+const { getIo } = require("../socket.js");
 
 const ACCESS_TOKEN_SECRET = "supersecret_access";
 const REFRESH_TOKEN_SECRET = "supersecret_refresh";
@@ -9,8 +10,64 @@ const chatId = "-1002731194100"; // ID канала или чата, куда б
 const bot = new Bot(token);
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-//bot.on('message', (ctx) => console.log(ctx.chat.id));
+
 bot.start().catch((err) => console.error("Bot startup error:", err));
+
+// Функция для создания уникального ID комнаты
+function createRoomId(userId) {
+  return `chat-${userId}`;
+}
+
+// Обработка входящих сообщений из Telegram
+bot.on("message:text", async (ctx) => {
+  const telegramChatId = ctx.chat.id.toString();
+  const messageText = ctx.message.text;
+  const threadId = ctx.message.message_thread_id?.toString();
+
+  const io = getIo();
+  if (!io) {
+    console.error('Ошибка: io не доступно в обработчике Telegram');
+    return;
+  }
+
+  // Находим пользователя по threadId
+  const user = await User.findOne({ where: { threadId } });
+  if (!user) {
+    console.log(`No user found for threadId ${threadId}`);
+    return;
+  }
+
+  // Создаём сообщение в базе данных
+  const message = await Message.create({
+    content: messageText,
+    user: `telegram-${telegramChatId}`,
+    userId: user.id,
+  });
+
+  // Отправляем сообщение в комнату пользователя
+  const roomId = createRoomId(user.id);
+
+  io.to(roomId).emit("newMessage", {
+    id: message.id,
+    content: message.content,
+    user: message.user,
+    //timestamp: message.createdAt.toISOString(),
+  });
+
+  // Отправляем в комнату админа
+  io.to("admin-room").emit("adminMessage", {
+    roomId,
+    id: message.id,
+    content: message.content,
+    user: message.user,
+    //timestamp: message.createdAt.toISOString(),
+  });
+
+  // Логируем для админа
+  console.log(
+    `[Admin Log] Telegram (${telegramChatId}) -> User ${user.id}: ${messageText}`
+  );
+});
 
 // Обработчики запросов
 const root = {
@@ -136,57 +193,70 @@ const root = {
     }
   },
 
-  messages: async () => {
-    return await Message.findAll();
+  messages: async (args, context) => {
+    const userId = context.user?.id;
+    if (!userId) throw new Error("Not authenticated");
+    return await Message.findAll({ where: { userId } });
   },
 
   sendMessage: async ({ content, user }, context) => {
-    //console.log(content, user, context);
-
     const userId = context.user;
     if (!userId) {
       throw new Error("Not authenticated");
-    } else {
-      const userInstance = await User.findByPk(userId.id);
-      const message = await Message.create({
-        content,
-        user: user,
-        userId: userId.id,
-      });
+    }
 
-      if (!userInstance.threadId) {
-        const thread = await bot.api.createForumTopic(
-          chatId,
-          `Тема для ${userInstance.email} (ID: ${userInstance.id})`
-        );
+    const userInstance = await User.findByPk(userId.id);
+    const message = await Message.create({
+      content,
+      user,
+      userId: userId.id,
+    });
 
-        const threadId = thread.message_thread_id;
-        console.log("Залупема", thread);
+    if (!userInstance.threadId) {
+      const thread = await bot.api.createForumTopic(
+        chatId,
+        `Тема для ${userInstance.email} (ID: ${userInstance.id})`
+      );
 
-        await userInstance.update({ threadId });
-        //await userId.save();
-
-        // Отправляем приветственное сообщение в тему
-        await bot.api.sendMessage(
-          chatId,
-          `Тема создана для ${userInstance.email}!`,
-          { message_thread_id: threadId }
-        );
-      }
+      const threadId = thread.message_thread_id;
+      await userInstance.update({ threadId });
 
       await bot.api.sendMessage(
         chatId,
-        `Новое сообщение от ${userInstance.email}: ${message.content}`,
-        { message_thread_id: userInstance.threadId }
+        `Тема создана для ${userInstance.email}!`,
+        { message_thread_id: threadId }
       );
-
-      context.io.emit("newMessage", {
-        id: message.id,
-        content: message.content,
-        user: message.user,
-      });
-      return message;
     }
+
+    await bot.api.sendMessage(
+      chatId,
+      `Новое сообщение от ${userInstance.email}: ${message.content}`,
+      { message_thread_id: userInstance.threadId }
+    );
+
+    const roomId = createRoomId(userId.id);
+    const messageData = {
+      id: message.id,
+      content: message.content,
+      user: message.user,
+      //timestamp: message.createdAt.toISOString(),
+    };
+
+    // Отправляем сообщение в комнату пользователя
+    context.io.to(roomId).emit("newMessage", messageData);
+
+    // Отправляем в комнату админа
+    context.io.to("admin-room").emit("adminMessage", {
+      roomId,
+      ...messageData,
+    });
+
+    // Логируем для админа
+    console.log(
+      `[Admin Log] User ${userId.id} -> Telegram (${userInstance.threadId}): ${content}`
+    );
+
+    return message;
   },
 };
 
